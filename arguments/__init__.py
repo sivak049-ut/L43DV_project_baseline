@@ -3,21 +3,27 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
+#
+# ---- Mirror-3DGS extensions ----
+# Added hyperparameters: stage1_iterations, lambda_mask, lambda_depth,
+# ransac_threshold, mirror_fill_color.
 #
 
 from argparse import ArgumentParser, Namespace
 import sys
 import os
 
+
 class GroupParams:
     pass
 
+
 class ParamGroup:
-    def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
+    def __init__(self, parser: ArgumentParser, name: str, fill_none=False):
         group = parser.add_argument_group(name)
         for key, value in vars(self).items():
             shorthand = False
@@ -25,7 +31,7 @@ class ParamGroup:
                 shorthand = True
                 key = key[1:]
             t = type(value)
-            value = value if not fill_none else None 
+            value = value if not fill_none else None
             if shorthand:
                 if t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
@@ -44,7 +50,8 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
@@ -63,6 +70,7 @@ class ModelParams(ParamGroup):
         g.source_path = os.path.abspath(g.source_path)
         return g
 
+
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
@@ -71,9 +79,11 @@ class PipelineParams(ParamGroup):
         self.antialiasing = False
         super().__init__(parser, "Pipeline Parameters")
 
+
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        # --- Vanilla 3DGS defaults ---
+        self.iterations = 70_000                 # Paper: 5k + 65k = 70k total
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -87,7 +97,7 @@ class OptimizationParams(ParamGroup):
         self.exposure_lr_delay_steps = 0
         self.exposure_lr_delay_mult = 0.0
         self.percent_dense = 0.01
-        self.lambda_dssim = 0.2
+        self.lambda_dssim = 0.2                  # Paper γ = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
@@ -97,9 +107,17 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+
+        # --- Mirror-3DGS hyperparameters (Paper §III-A) ---
+        self.stage1_iterations = 5_000           # End of Stage 1
+        self.lambda_mask = 1.0                   # λ_mask  (Paper Eq. 13/15)
+        self.lambda_depth = 0.1                  # λ_depth (Paper Eq. 13)
+        self.ransac_threshold = 0.01             # RANSAC inlier threshold
+
         super().__init__(parser, "Optimization Parameters")
 
-def get_combined_args(parser : ArgumentParser):
+
+def get_combined_args(parser: ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
@@ -116,7 +134,7 @@ def get_combined_args(parser : ArgumentParser):
     args_cfgfile = eval(cfgfile_string)
 
     merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
+    for k, v in vars(args_cmdline).items():
+        if v is not None:
             merged_dict[k] = v
     return Namespace(**merged_dict)

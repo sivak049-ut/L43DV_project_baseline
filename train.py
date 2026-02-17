@@ -3,25 +3,44 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+# ========================================================================
+# Mirror-3DGS: Faithful implementation of
+#   Meng et al., "Mirror-3DGS: Incorporating Mirror Reflections into
+#   3D Gaussian Splatting", arXiv 2404.01168v2.
+#
+# Two-stage training (Paper §II-D, Fig. 3):
+#   Stage 1 (iters 1 – stage1_iterations):
+#       - GT mirror regions replaced with red  (C^m_wo)
+#       - Losses: L^1_rgb + λ_mask·L_mask + λ_depth·L_depth + L_plane
+#   Stage 2 (iters stage1_iterations+1 – iterations):
+#       - Fused image from original + mirrored viewpoint  (C_fuse, Eq. 9)
+#       - Losses: L^2_rgb + λ_mask·L_mask
+#       - Mirror plane equation is *fixed*.
+# ========================================================================
 
 import os
+import sys
+import uuid
 import torch
+import numpy as np
 from random import randint
+from tqdm import tqdm
+from PIL import Image
+
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
-import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
-import uuid
-from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.mirror_utils import load_mirror_masks, get_mask_for_camera
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,16 +59,23 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+
+# -----------------------------------------------------------------------
+# Main training loop
+# -----------------------------------------------------------------------
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations,
+             checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
-        sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+        sys.exit("sparse_adam requested but not available.")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -57,44 +83,68 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    # [Mirror-3DGS] Red fill colour for Stage 1  (Paper §II-D, "red")
+    RED = torch.tensor([1.0, 0.0, 0.0], device="cuda").reshape(3, 1, 1)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
-    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    # [Mirror-3DGS] Load GT mirror masks
+    mirror_masks = load_mirror_masks(dataset.source_path)
+
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
+
+    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
+    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init,
+                                        opt.depth_l1_weight_final,
+                                        max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
-    ema_loss_for_log = 0.0
-    ema_Ll1depth_for_log = 0.0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    ema_loss_for_log = 0.0
+    ema_mask_for_log = 0.0
+    ema_plane_for_log = 0.0
+
+    # [Mirror-3DGS] Mirror plane state (set at end of Stage 1)
+    mirror_transform = None
+
+    STAGE1_END = opt.stage1_iterations  # Paper: 5000
+
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training")
     first_iter += 1
+
     for iteration in range(first_iter, opt.iterations + 1):
-        if network_gui.conn == None:
+        # --- GUI (optional, disabled in Colab) ---
+        if network_gui.conn is None:
             network_gui.try_connect()
-        while network_gui.conn != None:
+        while network_gui.conn is not None:
             try:
                 net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                custom_cam, do_training, pipe.convert_SHs_python, \
+                    pipe.compute_cov3D_python, keep_alive, scaling_modifer = \
+                    network_gui.receive()
+                if custom_cam is not None:
+                    net_image = render(custom_cam, gaussians, pipe, background,
+                                      scaling_modifier=scaling_modifer)["render"]
+                    net_image_bytes = memoryview(
+                        (torch.clamp(net_image, 0, 1) * 255)
+                        .byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                if do_training and (iteration < opt.iterations or not keep_alive):
                     break
-            except Exception as e:
+            except Exception:
                 network_gui.conn = None
 
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
+        # SH degree increase  (vanilla 3DGS: every 1000 iters)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
+        # -----------------------------------------------------------
+        # Pick a random training camera
+        # -----------------------------------------------------------
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -102,108 +152,226 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
 
-        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
+        bg = torch.rand(3, device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        # -----------------------------------------------------------
+        # GT image & mirror mask
+        # -----------------------------------------------------------
+        gt_image = viewpoint_cam.original_image.cuda()           # (3, H, W)
+        gt_mask = get_mask_for_camera(mirror_masks, viewpoint_cam,
+                                      (int(viewpoint_cam.image_width),
+                                       int(viewpoint_cam.image_height)))
+        # gt_mask: (1, H, W) in [0, 1]
+        gt_mask_3ch = gt_mask.expand_as(gt_image)                # (3, H, W)
+        has_mirror = gt_mask.sum() > 0
 
-        if viewpoint_cam.alpha_mask is not None:
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+        # ====================================================================
+        #  STAGE 1  (Paper §II-D, Eq. 10, 11, 12, 13)
+        # ====================================================================
+        if iteration <= STAGE1_END:
 
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
+            # Build Stage-1 target: mirror regions replaced with red
+            gt_stage1 = gt_image * (1.0 - gt_mask_3ch) + RED * gt_mask_3ch
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            # Render from original viewpoint + mirror mask
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg,
+                                render_mirror_mask=True,
+                                render_depth=(depth_l1_weight(iteration) > 0),
+                                separate_sh=SPARSE_ADAM_AVAILABLE)
+            image = render_pkg["render"]
+            viewspace_point_tensor = render_pkg["viewspace_points"]
+            visibility_filter = render_pkg["visibility_filter"]
+            radii = render_pkg["radii"]
+            rendered_mask = render_pkg["mirror_mask"]        # (1, H, W)
 
-        # Depth regularization
-        Ll1depth_pure = 0.0
-        if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
+            # Apply alpha mask if present
+            if viewpoint_cam.alpha_mask is not None:
+                image = image * viewpoint_cam.alpha_mask.cuda()
 
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-            loss += Ll1depth
-            Ll1depth = Ll1depth.item()
-        else:
-            Ll1depth = 0
+            # --- L^1_rgb  (Paper Eq. 10) ---
+            Ll1 = l1_loss(image, gt_stage1)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_val = fused_ssim(image.unsqueeze(0), gt_stage1.unsqueeze(0))
+            else:
+                ssim_val = ssim(image, gt_stage1)
+            loss_rgb = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
 
+            # --- L_mask  (Paper Eq. 5) ---
+            loss_mask = opt.lambda_mask * l1_loss(rendered_mask, gt_mask)
+
+            # --- L_depth  (Paper Eq. 11) ---
+            loss_depth = torch.tensor(0.0, device="cuda")
+            if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
+                inv_depth_pred = render_pkg["depth"]
+                inv_depth_gt = viewpoint_cam.invdepthmap.cuda()
+                depth_mask_cam = viewpoint_cam.depth_mask.cuda()
+                loss_depth = (depth_l1_weight(iteration)
+                              * torch.abs((inv_depth_pred - inv_depth_gt) * depth_mask_cam).mean())
+
+            # --- L_plane  (Paper Eq. 12) – active once plane is estimated ---
+            loss_plane = gaussians.get_plane_loss()
+
+            # --- Total Stage-1 loss  (Paper Eq. 13) ---
+            loss = loss_rgb + loss_mask + opt.lambda_depth * loss_depth + loss_plane
+
+        # ====================================================================
+        #  Transition: estimate mirror plane at end of Stage 1
+        # ====================================================================
+        if iteration == STAGE1_END:
+            print(f"\n[Mirror-3DGS] === End of Stage 1 (iter {iteration}) ===")
+            print("[Mirror-3DGS] Estimating mirror plane via RANSAC ...")
+            mirror_transform = gaussians.compute_mirror_plane(
+                ransac_threshold=opt.ransac_threshold)
+            # Save plane for evaluation (render_mirror.py)
+            import json as _json
+            _plane_path = os.path.join(scene.model_path, "mirror_plane.json")
+            with open(_plane_path, "w") as _f:
+                _json.dump({"plane_eq": [float(x) for x in gaussians.mirror_plane_eq]}, _f, indent=2)
+            print(f"[Mirror-3DGS] Saved plane to {_plane_path}")
+            print("[Mirror-3DGS] Mirror plane fixed for Stage 2.\n")
+
+        # ====================================================================
+        #  STAGE 2  (Paper §II-D, Eq. 9, 14, 15)
+        # ====================================================================
+        if iteration > STAGE1_END:
+
+            # Render from *original* viewpoint (for non-mirror regions + mask)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg,
+                                render_mirror_mask=True,
+                                separate_sh=SPARSE_ADAM_AVAILABLE)
+            image_orig = render_pkg["render"]
+            viewspace_point_tensor = render_pkg["viewspace_points"]
+            visibility_filter = render_pkg["visibility_filter"]
+            radii = render_pkg["radii"]
+            rendered_mask = render_pkg["mirror_mask"]        # (1, H, W)
+
+            # Render from *mirrored* viewpoint (for mirror regions)
+            mirror_pkg = render(viewpoint_cam, gaussians, pipe, bg,
+                                mirror_transform=mirror_transform,
+                                separate_sh=SPARSE_ADAM_AVAILABLE)
+            image_mirror = mirror_pkg["render"]
+
+            # --- Image fusion  (Paper Eq. 9) ---
+            M = rendered_mask.expand_as(image_orig)           # (3, H, W)
+            image = image_orig * (1.0 - M) + image_mirror * M
+
+            # Apply alpha mask if present
+            if viewpoint_cam.alpha_mask is not None:
+                alpha = viewpoint_cam.alpha_mask.cuda()
+                image = image * alpha
+
+            # --- L^2_rgb  (Paper Eq. 14) ---
+            Ll1 = l1_loss(image, gt_image)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_val = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            else:
+                ssim_val = ssim(image, gt_image)
+            loss_rgb = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
+
+            # --- L_mask  (Paper Eq. 5, still active) ---
+            loss_mask = opt.lambda_mask * l1_loss(rendered_mask, gt_mask)
+
+            # --- Total Stage-2 loss  (Paper Eq. 15) ---
+            loss = loss_rgb + loss_mask
+
+            loss_depth = torch.tensor(0.0, device="cuda")
+            loss_plane = torch.tensor(0.0, device="cuda")
+
+        # ====================================================================
+        #  Backward + optimiser step
+        # ====================================================================
         loss.backward()
-
         iter_end.record()
 
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+            ema_mask_for_log = 0.4 * loss_mask.item() + 0.6 * ema_mask_for_log
+            ema_plane_for_log = 0.4 * loss_plane.item() + 0.6 * ema_plane_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                stage = "S1" if iteration <= STAGE1_END else "S2"
+                progress_bar.set_postfix({
+                    "Stage": stage,
+                    "Loss": f"{ema_loss_for_log:.5f}",
+                    "Mask": f"{ema_mask_for_log:.5f}",
+                    "Plane": f"{ema_plane_for_log:.5f}",
+                    "Pts": f"{len(gaussians.get_xyz)}",
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+            # Logging & saving
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss,
+                            iter_start.elapsed_time(iter_end),
+                            testing_iterations, scene, render,
+                            (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None,
+                             dataset.train_test_exp),
+                            dataset.train_test_exp)
+
+            if iteration in saving_iterations:
+                print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
-            # Densification
+            # Densification  (same schedule as vanilla 3DGS)
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussians.max_radii2D[visibility_filter] = torch.max(
+                    gaussians.max_radii2D[visibility_filter],
+                    radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor,
+                                                  visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if (iteration > opt.densify_from_iter
+                        and iteration % opt.densification_interval == 0):
+                    size_threshold = (20 if iteration > opt.opacity_reset_interval
+                                      else None)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005,
+                                               scene.cameras_extent,
+                                               size_threshold, radii)
+
+                if (iteration % opt.opacity_reset_interval == 0
+                        or (dataset.white_background
+                            and iteration == opt.densify_from_iter)):
                     gaussians.reset_opacity()
 
-            # Optimizer step
+            # Optimiser step
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                gaussians.exposure_optimizer.zero_grad(set_to_none=True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
-                    gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
                     gaussians.optimizer.step()
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                gaussians.optimizer.zero_grad(set_to_none=True)
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            if iteration in checkpoint_iterations:
+                print(f"\n[ITER {iteration}] Saving Checkpoint")
+                torch.save((gaussians.capture(), iteration),
+                           scene.model_path + f"/chkpnt{iteration}.pth")
 
-def prepare_output_and_logger(args):    
+
+# -----------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
+            unique_str = os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
-    # Set up output folder
+
     print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
+    os.makedirs(args.model_path, exist_ok=True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
@@ -211,49 +379,68 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
+                    testing_iterations, scene, renderFunc, renderArgs,
+                    train_test_exp):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
-    # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
+        validation_configs = (
+            {'name': 'test',  'cameras': scene.getTestCameras()},
+            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
+                                           for idx in range(5, 30, 5)]},
+        )
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    image = torch.clamp(
+                        renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"],
+                        0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
                     if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        tb_writer.add_images(
+                            f"{config['name']}_view_{viewpoint.image_name}/render",
+                            image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                            tb_writer.add_images(
+                                f"{config['name']}_view_{viewpoint.image_name}/ground_truth",
+                                gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])
+                print(f"\n[ITER {iteration}] Evaluating {config['name']}: "
+                      f"L1 {l1_test} PSNR {psnr_test}")
                 if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(f"{config['name']}/loss_viewpoint - l1_loss",
+                                         l1_test, iteration)
+                    tb_writer.add_scalar(f"{config['name']}/loss_viewpoint - psnr",
+                                         psnr_test, iteration)
 
         if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+            tb_writer.add_histogram("scene/opacity_histogram",
+                                    scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('total_points',
+                                 scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+
+# -----------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------
+
 if __name__ == "__main__":
-    # Set up command line argument parser
-    parser = ArgumentParser(description="Training script parameters")
+    parser = ArgumentParser(description="Mirror-3DGS Training")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
@@ -261,25 +448,28 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int,
+                        default=[5_000, 30_000, 70_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int,
+                        default=[5_000, 30_000, 70_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--start_checkpoint", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
+
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
-    # All done
+    training(lp.extract(args), op.extract(args), pp.extract(args),
+             args.test_iterations, args.save_iterations,
+             args.checkpoint_iterations, args.start_checkpoint,
+             args.debug_from)
+
     print("\nTraining complete.")
